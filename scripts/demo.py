@@ -19,7 +19,7 @@ def main():
         try:
             if json_request("/actuator/health")["status"] == "UP":
                 break
-        except URLError:
+        except (URLError, ConnectionError, TimeoutError):
             pass
         time.sleep(1)
     else:
