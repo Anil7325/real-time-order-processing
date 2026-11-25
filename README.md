@@ -1,24 +1,49 @@
-Real-Time Order Processing System
-I built a Java 21 and Spring Boot application to explore a common order-processing problem: how can an API confirm that it received an order while a background worker is still processing it? In this project, the API saves the order in PostgreSQL and immediately returns an order ID. A Kafka consumer then updates its status from `PENDING` to `PROCESSED`.
-I kept the API and worker in one Spring Boot application so I could run the whole flow locally and focus on two things: recovering from a failed publish and handling the same event twice.
-What happens to an order
-When I submit a SKU and quantity to `POST /orders`, the API validates both fields and inserts a pending order in PostgreSQL. The response includes a `Location` header pointing to `GET /orders/{id}`, where I can follow that order.
-A scheduled publisher checks PostgreSQL for unpublished orders once per second. It sends each order ID to the `orders.created` Kafka topic. The consumer uses that ID to update the corresponding database row. In this demo, processing an order means recording that status change.
-Design decisions
-Recovering from a failed publish. I store the publication flag on the order row itself. The publisher sets it only after Kafka acknowledges the message. If the broker is unavailable, the row stays eligible for the next attempt.
-Handling duplicate events. A crash after Kafka acknowledges a message can cause the publisher to send it again. I made the consumer update conditional on `status = 'PENDING'`. After the first delivery changes the status, a second delivery updates zero rows.
-Keeping status reads current. I cache only `PROCESSED` in Redis, for ten minutes. Caching `PENDING` could leave someone looking at an old status after the worker has finished. On a cache miss or a Redis connection error, the app reads from PostgreSQL.
-How I verified it
-I ran the four containers with Docker Compose, created an order from PowerShell, and checked its status by ID. I then ran the Python demo, which created a second order and polled the API until it finished. These are the two responses from that run:
-```text
-Created:   60fa4b4d-6baa-4255-a67d-97b42ba00278  PENDING
-Processed: 60fa4b4d-6baa-4255-a67d-97b42ba00278  PROCESSED
-```
-The seven JUnit and Mockito tests cover order creation, invalid quantity, an unknown order ID, successful and failed Kafka publication, a Redis cache hit, and a database lookup when Redis is unavailable. The GitHub Actions workflow builds the stack and runs the end-to-end demo on pushes and pull requests.
-Run locally
-With Docker Compose and Python 3 installed, run these commands from the repository root:
+# Real-Time Order Processing System
+
+I built an event-driven order processing application that accepts an order through a REST API and processes it asynchronously with Kafka. The caller gets an order ID immediately and can use it to check when processing finishes.
+
+**Tech stack:** Java 21, Spring Boot, Apache Kafka, PostgreSQL, Redis, Docker Compose, JUnit, and Mockito.
+
+## How an order moves through the system
+
+1. **Create the order.** `POST /orders` accepts a product SKU and quantity. The API validates the request, saves the order in PostgreSQL, and returns its ID with the status `PENDING`.
+2. **Publish the event.** A scheduled publisher picks up unpublished orders and sends their IDs to the `orders.created` Kafka topic.
+3. **Process the order.** A Kafka consumer receives the ID and updates the order from `PENDING` to `PROCESSED`.
+4. **Read the result.** `GET /orders/{id}` returns the current status. Once an order is processed, its status can be served from Redis.
+
+## Design decisions
+
+- **Recovering from a failed publish.** I stored a publication flag on each order and set it only after Kafka acknowledged the message. If a send fails, the publisher can pick up the order again.
+- **Handling duplicate events.** I made the consumer update only rows whose status is still `PENDING`. If Kafka delivers the same order ID twice, the second delivery leaves the completed order alone.
+- **Keeping status reads current.** I cached only `PROCESSED`, with a ten-minute expiration. This keeps an old `PENDING` value from hiding a completed order. If Redis is unavailable, the API reads from PostgreSQL.
+
+## How I tested it
+
+I ran the API, Kafka, PostgreSQL, and Redis locally with Docker Compose. I first submitted an order from PowerShell, then ran a Python demo that created a new order and polled the API until processing finished. Both responses below came from the same demo run.
+
+| Step | Order ID | Status |
+| --- | --- | --- |
+| Order created | `60fa4b4d-6baa-4255-a67d-97b42ba00278` | `PENDING` |
+| Status checked | `60fa4b4d-6baa-4255-a67d-97b42ba00278` | `PROCESSED` |
+
+The project includes seven JUnit and Mockito tests covering API validation and responses, Kafka publication success and failure, Redis cache hits, and database fallback.
+
+## Run locally
+
+With Docker Compose and Python 3 installed, run these commands from the project folder:
+
 ```sh
 docker compose up --build -d
 python scripts/demo.py
 ```
-The API listens at `http://127.0.0.1:18080`. Spring Boot Actuator exposes service health at `/actuator/health` and HTTP request metrics at `/actuator/metrics/http.server.requests`. Use `docker compose logs -f app` to follow processed order IDs and `docker compose down` to stop the stack.
+
+The demo prints `Created` and `Processed` for the same order ID.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /orders` | Create an order |
+| `GET /orders/{id}` | Check its status |
+| `GET /actuator/health` | Check application health |
+| `GET /actuator/metrics/http.server.requests` | Inspect HTTP request metrics |
+
+The local API runs at `http://127.0.0.1:18080`. To stop the services, run `docker compose down`.
